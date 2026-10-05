@@ -1,6 +1,7 @@
 # Job-Context Client - the whole app in one file.
-# Run it with:   python jobcontext.txt          (Python runs .txt files fine)
-# First time:    run install.bat (or: python jobcontext.txt --install)
+# Run it with:   py jobcontext.txt              (Python runs .txt files fine;
+#                                                use "python" if "py" isn't available)
+# First time:    run install.bat (or: py jobcontext.txt --install)
 #
 # Needs only Python 3.9+ and its standard library - nothing to pip install.
 #
@@ -16,7 +17,7 @@
 #   9. WEB PAGE: JAVASCRIPT
 #  10. INSTALL & STARTUP
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.0.1"
 
 import base64
 import json
@@ -1363,8 +1364,15 @@ def install():
     print(f"  Data folder ready: {DATA}")
     if os.name == "nt":
         bat = APP_DIR / "Start Job-Context.bat"
-        bat.write_text('@echo off\ncd /d "%~dp0"\n'          # text mode writes \r\n
-                       f'"{sys.executable}" jobcontext.txt %*\n'
+        # Prefer the "py" launcher (works even when "python" isn't on PATH); fall back
+        # to the exact Python that ran this install. Text mode writes \r\n line endings.
+        bat.write_text('@echo off\ncd /d "%~dp0"\n'
+                       "where py >nul 2>nul\n"
+                       "if not errorlevel 1 (\n"
+                       "  py -3 jobcontext.txt %*\n"
+                       ") else (\n"
+                       f'  "{sys.executable}" jobcontext.txt %*\n'
+                       ")\n"
                        "if errorlevel 1 pause\n", encoding="utf-8")
         print(f"\n  Created: {bat.name}  (double-click it to start the app)")
     print("\nInstall complete. Your API key is entered in the app under Settings.")

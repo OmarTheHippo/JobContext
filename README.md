@@ -15,8 +15,10 @@ machine and easy to edit by uploading a single file to an AI assistant.
 3. Double-click `Start Job-Context.bat`. The app opens in your browser at
    `http://127.0.0.1:5000`. Closing the console window stops it.
 
-If `.bat` files can't be run, use `python jobcontext.txt --install` and then
-`python jobcontext.txt`. Python runs a `.txt` file fine.
+If `.bat` files can't be run, use `py jobcontext.txt --install` and then
+`py jobcontext.txt` (or `python ...` if your machine has that command instead of `py`).
+Python runs a `.txt` file fine. Both `.bat` files use the `py` launcher when it's present,
+so they work on machines where only `py` is available.
 
 ## First run: Settings
 
