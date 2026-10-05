@@ -9,11 +9,16 @@ if not exist jobcontext.txt (
   exit /b 1
 )
 
+rem Find a working Python by actually running it. (Checking with "where" isn't reliable,
+rem and Windows has a fake "python" that only prints "Python was not found".)
 set "PY="
-where py >nul 2>nul && set "PY=py -3"
-if not defined PY where python >nul 2>nul && set "PY=python"
+py -c "import sys" >nul 2>nul && set "PY=py"
+if not defined PY python -c "import sys" >nul 2>nul && set "PY=python"
+if not defined PY python3 -c "import sys" >nul 2>nul && set "PY=python3"
 if not defined PY (
-  echo Python 3 was not found. Install Python 3.9 or newer, then run this again.
+  echo Couldn't start Python with "py", "python" or "python3" from this window.
+  echo If one of them works in your own terminal, open that terminal in this folder and run:
+  echo     py jobcontext.txt --install
   pause
   exit /b 1
 )
@@ -26,6 +31,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo Using: %PY%
 %PY% jobcontext.txt --install
 echo.
 pause
