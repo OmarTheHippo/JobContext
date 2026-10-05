@@ -1,0 +1,1409 @@
+# Job-Context Client - the whole app in one file.
+# Run it with:   python jobcontext.txt          (Python runs .txt files fine)
+# First time:    run install.bat (or: python jobcontext.txt --install)
+#
+# Needs only Python 3.9+ and its standard library - nothing to pip install.
+#
+# FILE MAP - search for the "# =====" lines to jump between sections:
+#   1. SETTINGS & PATHS
+#   2. API KEY STORAGE           (encrypted with your Windows login via DPAPI)
+#   3. MODEL PROVIDERS           <-- _genai_complete() is the one to adapt for your API
+#   4. STORAGE                   (JSON files under ./data)
+#   5. PROMPTS                   (how the system prompt and "update layer" are built)
+#   6. HTTP API                  (routes the web page calls)
+#   7. WEB PAGE: CSS
+#   8. WEB PAGE: HTML
+#   9. WEB PAGE: JAVASCRIPT
+#  10. INSTALL & STARTUP
+
+APP_VERSION = "1.0"
+
+import base64
+import json
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote
+
+# ===== 1. SETTINGS & PATHS ==========================================================
+
+APP_DIR = Path(__file__).resolve().parent
+DATA = Path(os.environ.get("JOBCTX_DATA_DIR", APP_DIR / "data"))
+SETTINGS_FILE = DATA / "settings.json"
+KINDS = ("contexts", "agents")
+HISTORY_LIMIT = 50
+ID_RE = re.compile(r"^[a-f0-9]{12}$")
+
+# The GenAI base URL and model are entered in Settings - nothing is built in.
+CHAT_PATH = "/chat/completions"     # appended to the base URL for each request
+
+DEFAULT_SETTINGS = {"provider": "genai", "model": "", "base_url": "", "max_tokens": 16000,
+                    "api_key_enc": ""}
+
+
+def load_settings() -> dict:
+    s = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        s.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+    return s
+
+
+def save_settings(s: dict):
+    DATA.mkdir(parents=True, exist_ok=True)
+    _write_json(SETTINGS_FILE, s)
+
+
+# ===== 2. API KEY STORAGE ===========================================================
+# The key is never written into this file. It is saved in data/settings.json,
+# encrypted with Windows DPAPI so only your Windows account on this PC can decrypt it.
+# (Copying settings.json to another PC or user won't work - re-enter the key there.)
+# On non-Windows systems it falls back to base64, which is NOT encryption.
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def _dpapi(data: bytes, encrypt: bool) -> bytes:
+        buf = ctypes.create_string_buffer(data, len(data))
+        blob_in = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _Blob()
+        fn = ctypes.windll.crypt32.CryptProtectData if encrypt else ctypes.windll.crypt32.CryptUnprotectData
+        if not fn(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+            raise OSError("Windows could not " + ("encrypt" if encrypt else "decrypt") + " the API key")
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+
+def encrypt_key(key: str) -> str:
+    if not key:
+        return ""
+    if os.name == "nt":
+        return "dpapi:" + base64.b64encode(_dpapi(key.encode(), True)).decode()
+    return "plain:" + base64.b64encode(key.encode()).decode()
+
+
+def decrypt_key(stored: str) -> str:
+    if not stored:
+        return ""
+    scheme, _, payload = stored.partition(":")
+    raw = base64.b64decode(payload)
+    if scheme == "dpapi":
+        try:
+            return _dpapi(raw, False).decode()
+        except Exception:
+            return ""          # saved by another user/PC - treat as "no key set"
+    return raw.decode()
+
+
+def shared_api_key() -> str:
+    """Fallback used only when no key is saved in Settings.
+
+    To share the key source your other GenAI apps use, paste the body of their
+    resolve_api_key(...) here (or import it) and return the key string, e.g.:
+        return resolve_api_key("...")
+    Return "" when there is no key. As shipped, this does nothing."""
+    return ""
+
+
+def get_api_key() -> str:
+    return decrypt_key(load_settings().get("api_key_enc", "")) or shared_api_key()
+
+
+def api_key_source() -> str:
+    if decrypt_key(load_settings().get("api_key_enc", "")):
+        return "saved in Settings"
+    return "from shared_api_key()" if shared_api_key() else ""
+
+
+# ===== 3. MODEL PROVIDERS ===========================================================
+# Every provider is a function: (system: str, messages: list, settings: dict) -> str
+#   messages = [{"role": "user" | "assistant", "content": "..."}, ...]
+# Raise LLMError("readable message") on failure - the page shows it to you as-is.
+
+
+class LLMError(Exception):
+    pass
+
+
+def complete(system: str, messages: list) -> str:
+    s = load_settings()
+    fn = PROVIDERS.get(s["provider"])
+    if not fn:
+        raise LLMError(f"Unknown provider {s['provider']!r} - pick one in Settings.")
+    return fn(system, messages, s)
+
+
+def _model(s: dict) -> str:
+    return "" if s["provider"] == "mock" else (s.get("model") or "").strip()
+
+
+def _chat_endpoint(s: dict) -> str:
+    base = (s.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return base if base.endswith(CHAT_PATH) else base + CHAT_PATH
+
+
+def _genai_complete(system: str, messages: list, s: dict) -> str:
+    """Calls the GenAI API using the common "chat completions" JSON shape:
+        POST <base URL>/chat/completions   Authorization: Bearer <API key>
+        {"model": ..., "messages": [{"role": "system", ...}, ...], "max_tokens": ...}
+    and reads the reply from data["choices"][0]["message"]["content"].
+    ASSUMPTION: a base URL ending in /v1 usually means this format, but confirm it
+    against your other apps or the API docs; if it differs, change the three marked
+    lines. Proxies in the HTTPS_PROXY environment variable are used automatically, and
+    on Windows the system certificate store is trusted.
+    """
+    url, key = _chat_endpoint(s), get_api_key()
+    if not url:
+        raise LLMError("Set the Base URL in Settings.")
+    if not _model(s):
+        raise LLMError("Set the Model in Settings.")
+    if not key:
+        raise LLMError("No API key - add it in Settings.")
+    body = {                                                       # <-- 1. request body
+        "model": _model(s),
+        "messages": [{"role": "system", "content": system}] + messages,
+        "max_tokens": int(s.get("max_tokens") or 4000),
+    }
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {key}"}                  # <-- 2. auth header
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:500]
+        raise LLMError(f"GenAI API error {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise LLMError(f"Couldn't reach the GenAI API: {e.reason}")
+    try:
+        return data["choices"][0]["message"]["content"]           # <-- 3. reply text
+    except (KeyError, IndexError, TypeError):
+        raise LLMError("Unexpected response shape: " + json.dumps(data)[:500])
+
+
+def _mock_complete(system: str, messages: list, s: dict) -> str:
+    last = messages[-1]["content"] if messages else ""
+    if "<current_layer>" in last:
+        current = last.split("<current_layer>", 1)[1].split("</current_layer>", 1)[0].strip()
+        return current + "\n\n## Learned from chat (mock)\n- Added by the mock provider to demo the update flow."
+    heads = [l[2:] for l in system.splitlines() if l.startswith("# ")]
+    return ("**Mock reply** - no model was called.\n\nSystem prompt sections:\n"
+            + "\n".join(f"- {h}" for h in heads) + f"\n\nYou said: _{last[:200]}_")
+
+
+PROVIDERS = {"mock": _mock_complete, "genai": _genai_complete}
+
+
+# ===== 4. STORAGE ===================================================================
+# data/contexts/*.json, data/agents/*.json, data/chats/*.json - plain, readable JSON.
+
+
+class HttpError(Exception):
+    def __init__(self, status: int, msg: str):
+        super().__init__(msg)
+        self.status, self.msg = status, msg
+
+
+def _write_json(p: Path, obj):
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _dir(kind: str) -> Path:
+    d = DATA / kind
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _path(kind: str, item_id: str) -> Path:
+    if not ID_RE.match(item_id or ""):
+        raise HttpError(404, "Not found")
+    return _dir(kind) / f"{item_id}.json"
+
+
+def load(kind: str, item_id: str) -> dict:
+    p = _path(kind, item_id)
+    if not p.exists():
+        raise HttpError(404, "Not found")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def save(kind: str, item: dict) -> dict:
+    _write_json(_path(kind, item["id"]), item)
+    return item
+
+
+def load_all(kind: str) -> list:
+    items = [json.loads(p.read_text(encoding="utf-8")) for p in _dir(kind).glob("*.json")]
+    return sorted(items, key=lambda i: i.get("updated", 0), reverse=True)
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def new_layer(kind: str, name: str, content: str, description: str = "", history=None) -> dict:
+    now = time.time()
+    return save(kind, {"id": new_id(), "name": (name or "").strip() or "Untitled",
+                       "description": (description or "").strip(), "content": content or "",
+                       "created": now, "updated": now, "history": (history or [])[-HISTORY_LIMIT:]})
+
+
+def layer_summary(l: dict) -> dict:
+    out = {k: l.get(k) for k in ("id", "name", "description", "content", "updated")}
+    out["versions"] = len(l.get("history", []))
+    return out
+
+
+def chat_summary(c: dict) -> dict:
+    out = {k: c.get(k) for k in ("id", "title", "context_id", "agent_ids", "updated")}
+    out["count"] = len(c.get("messages", []))
+    return out
+
+
+# ===== 5. PROMPTS ===================================================================
+
+def build_system_prompt(chat: dict) -> str:
+    parts = ["You are an assistant supporting the user in their job. The sections below "
+             "are standing context about who they are and how you should help. Use them "
+             "without asking the user to repeat information already given here."]
+    if chat.get("context_id"):
+        try:
+            ctx = load("contexts", chat["context_id"])
+            parts.append(f"# Job context: {ctx['name']}\n\n{ctx['content'].strip()}")
+        except HttpError:
+            pass
+    agents = []
+    for aid in chat.get("agent_ids", []):
+        try:
+            agents.append(load("agents", aid))
+        except HttpError:
+            pass
+    if len(agents) > 1:
+        parts.append("Several specialist roles are active below. Draw on whichever fit "
+                     "the question, and combine them when a question spans roles.")
+    for a in agents:
+        parts.append(f"# Agent role: {a['name']}\n\n{a['content'].strip()}")
+    return "\n\n".join(parts)
+
+
+UPDATE_SYSTEM = """You maintain a reusable instruction layer that is injected as a system \
+prompt into future, unrelated conversations. Your job is to revise it using what was \
+learned in a conversation.
+
+Rules:
+- Keep everything in the current layer that is still accurate. Preserve its structure.
+- Add only durable, reusable knowledge: facts about the user's role, organisation, \
+standing preferences, recurring procedures, terminology, formats they want, and \
+corrections they made to how the assistant behaves.
+- Do not add one-off details that only matter to this particular task.
+- If the conversation contradicts the layer, update the layer to match the conversation.
+- If the user gave an explicit instruction about what to capture, follow it.
+- Keep it concise; merge duplicates rather than appending near-copies.
+- Output ONLY the complete revised layer in Markdown. No preamble, no explanation."""
+
+
+def build_update_request(layer: dict, kind: str, chat: dict, instruction: str) -> list:
+    label = "job context (who the user is)" if kind == "contexts" else f"agent role '{layer['name']}'"
+    transcript = "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in chat["messages"])
+    return [{"role": "user", "content":
+             f"The layer being revised is the {label}.\n\n"
+             f"<current_layer>\n{layer['content']}\n</current_layer>\n\n"
+             f"<conversation>\n{transcript}\n</conversation>\n\n"
+             f"<user_instruction>\n{instruction.strip() or '(none - use your judgement)'}\n"
+             f"</user_instruction>"}]
+
+
+# ===== 6. HTTP API ==================================================================
+# @route(method, regex) registers a handler. Handlers get the URL groups plus
+# body (parsed JSON) and query (dict of lists), and return a dict/list (sent as JSON)
+# or a Raw(...) for pages and file downloads.
+
+ROUTES = []
+
+
+def route(method, pattern):
+    def deco(fn):
+        ROUTES.append((method, re.compile("^" + pattern + "$"), fn))
+        return fn
+    return deco
+
+
+class Raw:
+    def __init__(self, data: bytes, ctype: str, filename: str = None):
+        self.data, self.ctype, self.filename = data, ctype, filename
+
+
+K = "(contexts|agents)"
+I = "([a-f0-9]{12})"
+
+
+@route("GET", "/")
+def page(body, query):
+    html = PAGE_HTML.replace("/*__CSS__*/", PAGE_CSS).replace("//__JS__", PAGE_JS)
+    return Raw(html.encode("utf-8"), "text/html; charset=utf-8")
+
+
+@route("GET", "/api/status")
+def status(body, query):
+    s = load_settings()
+    incomplete = s["provider"] == "genai" and not (get_api_key() and _chat_endpoint(s) and _model(s))
+    return {"provider": s["provider"], "model": _model(s), "version": APP_VERSION,
+            "needs_setup": not SETTINGS_FILE.exists() or incomplete}
+
+
+@route("GET", "/api/settings")
+def get_settings(body, query):
+    s, key = load_settings(), get_api_key()
+    return {"provider": s["provider"], "model": s.get("model", ""), "base_url": s.get("base_url", ""),
+            "max_tokens": s.get("max_tokens", 16000), "key_set": bool(key),
+            "key_hint": ("..." + key[-4:]) if len(key) > 8 else ("set" if key else ""),
+            "key_source": api_key_source(),
+            "key_storage": "encrypted for your Windows account" if os.name == "nt" else "NOT encrypted (non-Windows)",
+            "data_dir": str(DATA), "endpoint": _chat_endpoint(s)}
+
+
+@route("POST", "/api/settings")
+def set_settings(body, query):
+    s = load_settings()
+    if body.get("provider") in PROVIDERS:
+        s["provider"] = body["provider"]
+    for f in ("model", "base_url"):
+        if f in body:
+            s[f] = str(body[f]).strip()
+    if "max_tokens" in body:
+        try:
+            s["max_tokens"] = max(256, int(body["max_tokens"]))
+        except (TypeError, ValueError):
+            raise HttpError(400, "Max tokens must be a number.")
+    if body.get("clear_key"):
+        s["api_key_enc"] = ""
+    elif body.get("api_key"):                     # blank means "keep the saved key"
+        s["api_key_enc"] = encrypt_key(body["api_key"].strip())
+    save_settings(s)
+    return get_settings({}, {})
+
+
+@route("POST", "/api/settings/test")
+def test_settings(body, query):
+    t = time.time()
+    reply = complete("You are a connectivity test.", [{"role": "user", "content": "Reply with exactly: OK"}])
+    return {"reply": reply[:200], "seconds": round(time.time() - t, 1)}
+
+
+@route("GET", f"/api/{K}")
+def list_layers(kind, body, query):
+    return [layer_summary(l) for l in load_all(kind)]
+
+
+@route("POST", f"/api/{K}")
+def create_layer(kind, body, query):
+    return layer_summary(new_layer(kind, body.get("name"), body.get("content"), body.get("description")))
+
+
+@route("PUT", f"/api/{K}/{I}")
+def update_layer(kind, item_id, body, query):
+    layer = load(kind, item_id)
+    if "content" in body and body["content"] != layer["content"]:
+        layer["history"].append({"content": layer["content"], "saved": layer["updated"],
+                                 "note": body.get("note", "")})
+        layer["history"] = layer["history"][-HISTORY_LIMIT:]
+        layer["content"] = body["content"]
+    for f in ("name", "description"):
+        if f in body:
+            layer[f] = str(body[f]).strip()
+    layer["updated"] = time.time()
+    return layer_summary(save(kind, layer))
+
+
+@route("DELETE", f"/api/{K}/{I}")
+def delete_layer(kind, item_id, body, query):
+    _path(kind, item_id).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@route("GET", f"/api/{K}/{I}/history")
+def layer_history(kind, item_id, body, query):
+    return list(reversed(load(kind, item_id)["history"]))
+
+
+@route("GET", f"/api/{K}/{I}/export")
+def export_layer(kind, item_id, body, query):
+    l = load(kind, item_id)
+    name = re.sub(r"[^\w\- ]", "", l["name"]).strip() or "layer"
+    return Raw(f"# {l['name']}\n\n{l['content'].strip()}\n".encode("utf-8"),
+               "text/markdown; charset=utf-8", f"{name}.md")
+
+
+@route("GET", "/api/export")
+def export_bundle(body, query):
+    bundle = {"format": "job-context-client/1", "exported": time.time(),
+              "contexts": load_all("contexts"), "agents": load_all("agents")}
+    if query.get("chats") == ["1"]:
+        bundle["chats"] = load_all("chats")
+    return Raw(json.dumps(bundle, indent=2, ensure_ascii=False).encode("utf-8"), "application/json",
+               time.strftime("job-context-export-%Y%m%d-%H%M.json"))
+
+
+@route("POST", "/api/import")
+def import_files(body, query):
+    """body = {kind, files: [{name, text}]}. .md/.txt -> one layer each (a leading
+    "# Title" names it); .json -> an export bundle. Always adds, never overwrites."""
+    kind = body.get("kind") if body.get("kind") in KINDS else "contexts"
+    created = []
+    for f in body.get("files", []):
+        name, text = f.get("name", "imported"), f.get("text", "")
+        if name.lower().endswith(".json"):
+            try:
+                bundle = json.loads(text)
+            except ValueError:
+                raise HttpError(400, f"{name} is not valid JSON.")
+            id_map = {}                     # keep imported chats pointing at imported layers
+            for k in KINDS:
+                for item in bundle.get(k, []):
+                    new = new_layer(k, item.get("name"), item.get("content"),
+                                    item.get("description"), item.get("history"))
+                    id_map[item.get("id")] = new["id"]
+                    created.append(new["name"])
+            for chat in bundle.get("chats", []):
+                chat = dict(chat, id=new_id(), context_id=id_map.get(chat.get("context_id")),
+                            agent_ids=[id_map[a] for a in chat.get("agent_ids", []) if a in id_map])
+                save("chats", chat)
+                created.append(chat.get("title", "chat"))
+        else:
+            title = Path(name).stem
+            m = re.match(r"\s*#\s+(.+)\n+", text)
+            if m:
+                title, text = m.group(1).strip(), text[m.end():]
+            created.append(new_layer(kind, title, text.strip())["name"])
+    return {"created": created}
+
+
+@route("GET", "/api/chats")
+def list_chats(body, query):
+    return [chat_summary(c) for c in load_all("chats")]
+
+
+@route("POST", "/api/chats")
+def create_chat(body, query):
+    now = time.time()
+    return save("chats", {"id": new_id(), "title": body.get("title") or "New chat",
+                          "context_id": body.get("context_id") or None,
+                          "agent_ids": body.get("agent_ids", []), "messages": [],
+                          "created": now, "updated": now})
+
+
+@route("GET", f"/api/chats/{I}")
+def get_chat(item_id, body, query):
+    return load("chats", item_id)
+
+
+@route("PATCH", f"/api/chats/{I}")
+def patch_chat(item_id, body, query):
+    chat = load("chats", item_id)
+    for f in ("title", "context_id", "agent_ids"):
+        if f in body:
+            chat[f] = body[f]
+    chat["updated"] = time.time()
+    return save("chats", chat)
+
+
+@route("DELETE", f"/api/chats/{I}")
+def delete_chat(item_id, body, query):
+    _path("chats", item_id).unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@route("GET", f"/api/chats/{I}/system_prompt")
+def chat_system_prompt(item_id, body, query):
+    return {"system": build_system_prompt(load("chats", item_id))}
+
+
+@route("POST", f"/api/chats/{I}/messages")
+def send_message(item_id, body, query):
+    chat = load("chats", item_id)
+    text = (body.get("content") or "").strip()
+    if not text:
+        raise HttpError(400, "Empty message.")
+    history = [{"role": m["role"], "content": m["content"]} for m in chat["messages"]]
+    reply = complete(build_system_prompt(chat), history + [{"role": "user", "content": text}])
+    # Saved only after the call succeeds, so a failed send leaves no orphan message.
+    chat["messages"] += [{"role": "user", "content": text, "ts": time.time()},
+                         {"role": "assistant", "content": reply, "ts": time.time()}]
+    if chat["title"] == "New chat":
+        chat["title"] = text[:60] + ("..." if len(text) > 60 else "")
+    chat["updated"] = time.time()
+    return save("chats", chat)
+
+
+@route("POST", f"/api/chats/{I}/propose_update")
+def propose_update(item_id, body, query):
+    """Returns a proposed revision; nothing is saved until the page PUTs it back."""
+    chat = load("chats", item_id)
+    kind = body.get("kind")
+    if kind not in KINDS:
+        raise HttpError(400, "Pick a layer to update.")
+    layer = load(kind, body.get("id", ""))
+    if not chat["messages"]:
+        raise HttpError(400, "This chat has no messages to learn from yet.")
+    proposed = complete(UPDATE_SYSTEM, build_update_request(layer, kind, chat, body.get("instruction", "")))
+    return {"current": layer["content"], "proposed": proposed.strip(), "name": layer["name"]}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, status: int, data: bytes, ctype: str, filename: str = None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, status=200):
+        self._send(status, json.dumps(obj).encode("utf-8"), "application/json")
+
+    def _dispatch(self, method):
+        path, _, qs = self.path.partition("?")
+        for m, rx, fn in ROUTES:
+            match = rx.match(path) if m == method else None
+            if not match:
+                continue
+            try:
+                body = {}
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    body = json.loads(self.rfile.read(n).decode("utf-8"))
+                result = fn(*match.groups(), body=body, query=parse_qs(qs))
+            except HttpError as e:
+                return self._json({"error": e.msg}, e.status)
+            except LLMError as e:
+                return self._json({"error": str(e)}, 502)
+            except Exception as e:
+                traceback.print_exc()
+                return self._json({"error": f"Server error: {e}"}, 500)
+            if isinstance(result, Raw):
+                return self._send(200, result.data, result.ctype, result.filename)
+            return self._json(result)
+        self._json({"error": "Not found"}, 404)
+
+    def do_GET(self): self._dispatch("GET")
+    def do_POST(self): self._dispatch("POST")
+    def do_PUT(self): self._dispatch("PUT")
+    def do_PATCH(self): self._dispatch("PATCH")
+    def do_DELETE(self): self._dispatch("DELETE")
+
+    def log_message(self, *args):
+        pass                                    # keep the console quiet
+
+
+# ===== 7. WEB PAGE: CSS =============================================================
+
+PAGE_CSS = r"""
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --side: #efeeea; --text: #1d1d1b; --muted: #6b6a66;
+  --border: #dcdad4; --accent: #2f5fd0; --accent-text: #fff; --user: #e8eefc;
+  --danger: #b3261e; --code: #f0efeb; --warn: #8a5a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1b1d; --panel: #232326; --side: #18181a; --text: #e8e6e1; --muted: #9a9892;
+    --border: #3a3a3e; --accent: #6d93f2; --accent-text: #0e1220; --user: #2a3350;
+    --danger: #f2867e; --code: #2c2c30; --warn: #e0b45c;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 12px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+button.accent { border-color: var(--accent); color: var(--accent); }
+button.danger { color: var(--danger); }
+button.wide { width: 100%; }
+button.link { border: none; background: none; padding: 0; color: var(--warn); text-decoration: underline; }
+input, select, textarea { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; }
+textarea { resize: vertical; width: 100%; }
+.muted { color: var(--muted); } .small { font-size: 13px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row.end { justify-content: flex-end; margin-top: 12px; }
+.row.between { justify-content: space-between; }
+label.block { display: block; margin: 10px 0; }
+label.field { display: flex; flex-direction: column; gap: 3px; margin: 8px 0; font-size: 14px; }
+
+#app { display: flex; height: 100vh; }
+#sidebar { width: 270px; flex: none; background: var(--side); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px; padding: 12px; }
+#chat-search { width: 100%; }
+#chat-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+#chat-list li { padding: 7px 9px; border-radius: 6px; cursor: pointer; }
+#chat-list li:hover { background: var(--panel); }
+#chat-list li.active { background: var(--panel); outline: 1px solid var(--border); }
+#chat-list .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#chat-list .d { font-size: 12px; color: var(--muted); }
+.sidebar-foot { display: flex; flex-direction: column; gap: 6px; }
+.sidebar-foot .row button { flex: 1; }
+
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#empty-state { max-width: 620px; margin: 10vh auto; padding: 0 16px; }
+#chat-view { display: flex; flex-direction: column; height: 100%; }
+#chat-view[hidden] { display: none; }
+#chat-head { padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; gap: 8px; }
+#chat-title { border: none; font-size: 17px; font-weight: 600; padding: 2px 0; background: transparent; }
+#chat-layers { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border); }
+.chip.ctx { border-color: var(--accent); color: var(--accent); }
+.chip.none { color: var(--warn); border-color: var(--warn); }
+
+#messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.msg { max-width: 820px; width: 100%; margin: 0 auto; }
+.msg .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.msg .body { padding: 10px 14px; border-radius: 8px; background: var(--panel);
+  border: 1px solid var(--border); overflow-wrap: anywhere; }
+.msg.user .body { background: var(--user); border-color: transparent; white-space: pre-wrap; }
+.msg.pending .body { color: var(--muted); font-style: italic; }
+.msg.error .body { color: var(--danger); }
+.body p { margin: .4em 0; } .body ul, .body ol { margin: .4em 0; padding-left: 1.4em; }
+.body h1, .body h2, .body h3, .body h4 { margin: .7em 0 .3em; font-size: 1.05em; }
+.body code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: .92em; }
+.body pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; }
+.body pre code { background: none; padding: 0; }
+.msg .actions { text-align: right; margin-top: 2px; }
+.msg .actions button { font-size: 12px; padding: 1px 8px; border: none; background: none; color: var(--muted); }
+
+#composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border);
+  background: var(--panel); }
+#composer textarea { flex: 1; }
+
+dialog { border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+  color: var(--text); padding: 0; width: min(520px, calc(100vw - 32px)); }
+dialog.big { width: min(1100px, calc(100vw - 32px)); height: min(820px, calc(100vh - 32px)); }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+.dlg { padding: 18px 20px; display: flex; flex-direction: column; height: 100%; }
+.dlg h2 { margin: 0 0 8px; font-size: 18px; } .dlg h3 { margin: 12px 0 6px; font-size: 14px; }
+.pick { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.pick label { display: flex; gap: 8px; align-items: flex-start; padding: 5px 6px; border-radius: 6px; }
+.pick label:hover { background: var(--bg); }
+.pick .desc { font-size: 12px; color: var(--muted); }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+#prompt-text { flex: 1; overflow-y: auto; background: var(--code); padding: 12px; border-radius: 6px; margin: 0; }
+
+.tabs { display: flex; gap: 4px; }
+.tab.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.lib { display: flex; gap: 14px; flex: 1; min-height: 0; margin-top: 12px; }
+.lib-list { width: 230px; flex: none; display: flex; flex-direction: column; gap: 6px; }
+#lib-items { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+#lib-items li { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+#lib-items li.active, #lib-items li:hover { background: var(--bg); }
+.lib-edit { flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0; overflow-y: auto; }
+.lib-edit textarea.content { flex: 1; min-height: 300px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.history { border-top: 1px solid var(--border); padding-top: 8px; }
+.history li { margin: 4px 0; }
+
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1; min-height: 0; margin-top: 10px; }
+.compare > div { display: flex; flex-direction: column; min-height: 0; }
+.compare pre, .compare textarea { flex: 1; margin: 0; overflow-y: auto; background: var(--code);
+  padding: 10px; border-radius: 6px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+
+#toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text);
+  color: var(--bg); padding: 8px 16px; border-radius: 6px; font-size: 14px; z-index: 10; }
+
+@media (max-width: 760px) {
+  #app { flex-direction: column; }
+  #sidebar { width: 100%; max-height: 40vh; }
+  .lib, .compare { flex-direction: column; grid-template-columns: 1fr; }
+  .lib-list { width: 100%; }
+}
+"""
+
+# ===== 8. WEB PAGE: HTML ============================================================
+
+PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job-Context Client</title>
+<style>/*__CSS__*/</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <button id="btn-new-chat" class="primary wide">+ New chat</button>
+    <input id="chat-search" type="search" placeholder="Search chats">
+    <ul id="chat-list"></ul>
+    <div class="sidebar-foot">
+      <button id="btn-library" class="wide">Contexts &amp; agents</button>
+      <div class="row">
+        <button id="btn-import">Import</button>
+        <button id="btn-export">Export</button>
+      </div>
+      <button id="btn-settings" class="wide">Settings</button>
+      <div id="provider" class="muted small"></div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <section id="empty-state">
+      <h1>Job-Context Client</h1>
+      <p>Your job context and agent roles are sent as the system prompt on every call,
+         so you never have to re-explain who you are.</p>
+      <ol>
+        <li>Open <b>Settings</b> to choose the model provider and save your API key.</li>
+        <li>Open <b>Contexts &amp; agents</b> and edit the example job context.</li>
+        <li>Start a <b>New chat</b> and pick which agents to apply.</li>
+        <li>After a useful chat, use <b>Update layer</b> to fold what it learned back
+            into a context or agent.</li>
+      </ol>
+    </section>
+
+    <section id="chat-view" hidden>
+      <header id="chat-head">
+        <input id="chat-title" aria-label="Chat title">
+        <div id="chat-layers"></div>
+        <div class="row">
+          <button id="btn-edit-layers" title="Change the context/agents for this chat">Change layers</button>
+          <button id="btn-view-prompt">System prompt</button>
+          <button id="btn-update-layer" class="accent">Update layer…</button>
+          <button id="btn-delete-chat" class="danger">Delete</button>
+        </div>
+      </header>
+      <div id="messages"></div>
+      <form id="composer">
+        <textarea id="input" rows="3"
+          placeholder="Message (Enter to send, Shift+Enter for newline). /update <instruction> to grow an agent from this chat."></textarea>
+        <button id="btn-send" class="primary" type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+</div>
+
+<dialog id="dlg-layers">
+  <form method="dialog" class="dlg">
+    <h2 id="dlg-layers-title">New chat</h2>
+    <h3>Job context</h3>
+    <div id="pick-context" class="pick"></div>
+    <h3>Agents to apply</h3>
+    <div id="pick-agents" class="pick"></div>
+    <div class="row end">
+      <button value="cancel">Cancel</button>
+      <button id="btn-layers-ok" class="primary" type="button">Start chat</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-library" class="big">
+  <div class="dlg">
+    <div class="row between">
+      <div class="tabs">
+        <button data-kind="contexts" class="tab">Job contexts</button>
+        <button data-kind="agents" class="tab">Agents</button>
+      </div>
+      <button id="btn-library-close">Close</button>
+    </div>
+    <div class="lib">
+      <div class="lib-list">
+        <button id="btn-lib-new" class="wide">+ New</button>
+        <ul id="lib-items"></ul>
+      </div>
+      <div class="lib-edit" id="lib-edit"></div>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlg-update" class="big">
+  <div class="dlg">
+    <h2>Update a layer from this chat</h2>
+    <p class="muted small">The model reads this conversation and proposes a revised layer.
+      Nothing is saved until you click Save; the previous version is kept in history.</p>
+    <div class="row"><label>Layer <select id="upd-target"></select></label></div>
+    <label class="block">What should it capture? (optional)
+      <textarea id="upd-instruction" rows="2"
+        placeholder="e.g. Remember that briefings for the director are one page max, BLUF first."></textarea>
+    </label>
+    <div class="row">
+      <button id="btn-upd-propose" class="primary">Propose update</button>
+      <span id="upd-status" class="muted small"></span>
+    </div>
+    <div id="upd-compare" class="compare" hidden>
+      <div><h3>Current</h3><pre id="upd-current"></pre></div>
+      <div><h3>Proposed (editable)</h3><textarea id="upd-proposed"></textarea></div>
+    </div>
+    <div class="row end">
+      <button id="btn-upd-cancel">Close</button>
+      <button id="btn-upd-save" class="primary" disabled>Save to layer</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dlg-prompt" class="big">
+  <form method="dialog" class="dlg">
+    <h2>System prompt sent with this chat</h2>
+    <pre id="prompt-text"></pre>
+    <div class="row end"><button>Close</button></div>
+  </form>
+</dialog>
+
+<dialog id="dlg-settings">
+  <form method="dialog" class="dlg">
+    <h2>Settings</h2>
+    <label class="field">Model provider
+      <select id="set-provider">
+        <option value="genai">GenAI API (agency)</option>
+        <option value="mock">Mock - no API calls (try the UI)</option>
+      </select></label>
+    <div id="genai-fields">
+    <label class="field">Base URL
+      <input id="set-base-url" placeholder="e.g. https://your-genai-host/v1"></label>
+    <label class="field">Model
+      <input id="set-model" placeholder="model name as your API expects it"></label>
+    <div class="small muted" id="set-endpoint"></div>
+    </div>
+    <label class="field">API key
+      <input id="set-key" type="password" autocomplete="off" placeholder="paste to set or replace"></label>
+    <div class="small muted" id="set-key-status"></div>
+    <label class="field">Max reply tokens
+      <input id="set-max" type="number" min="256" step="256"></label>
+    <div class="small muted" id="set-data-dir"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn-set-test" type="button">Save &amp; test connection</button>
+      <button id="btn-set-clear" type="button" class="danger">Forget saved key</button>
+    </div>
+    <div class="small" id="set-test-result"></div>
+    <div class="row end">
+      <button value="cancel">Close</button>
+      <button id="btn-set-save" class="primary" type="button">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-import">
+  <form method="dialog" class="dlg">
+    <h2>Import</h2>
+    <p class="muted small"><b>.md / .txt</b> become one new layer each (a leading
+      "# Title" line names it). <b>.json</b> export bundles restore everything in them.
+      Imports always add - they never overwrite.</p>
+    <label>Import text files as
+      <select id="imp-kind"><option value="contexts">Job contexts</option>
+        <option value="agents">Agents</option></select></label>
+    <input id="imp-files" type="file" multiple accept=".md,.txt,.json">
+    <div class="row end">
+      <button value="cancel">Cancel</button>
+      <button id="btn-imp-ok" class="primary" type="button">Import</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-export">
+  <form method="dialog" class="dlg">
+    <h2>Export</h2>
+    <p class="muted small">Downloads one .json file with all contexts and agents
+      (including version history). Single layers can be exported as .md from the
+      Contexts &amp; agents editor. Your API key is never included.</p>
+    <label><input id="exp-chats" type="checkbox"> Include chat history</label>
+    <div class="row end">
+      <button value="cancel">Cancel</button>
+      <button id="btn-exp-ok" class="primary" type="button">Download</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" hidden></div>
+<script>//__JS__</script>
+</body>
+</html>
+"""
+
+# ===== 9. WEB PAGE: JAVASCRIPT ======================================================
+
+PAGE_JS = r"""
+const $ = (s) => document.querySelector(s);
+const state = { chats: [], contexts: [], agents: [], chat: null, libKind: "contexts", libSel: null };
+
+// --- helpers -------------------------------------------------------------------------
+async function api(path, opts = {}) {
+  const init = { method: opts.method || (opts.json !== undefined ? "POST" : "GET") };
+  if (opts.json !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(opts.json);
+  }
+  const r = await fetch(path, init);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `Request failed (${r.status})`);
+  return data;
+}
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.hidden = false;
+  clearTimeout(toast.h); toast.h = setTimeout(() => (t.hidden = true), 2600);
+}
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const when = (ts) => new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const byId = (list, id) => list.find((x) => x.id === id);
+
+// Minimal Markdown: code blocks, inline code, headings, lists, bold/italic, paragraphs.
+function md(src) {
+  const blocks = [];
+  src = src.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => {
+    blocks.push(`<pre><code>${esc(code)}</code></pre>`); return `\u0000${blocks.length - 1}\u0000`;
+  });
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+    .replace(/(^|\W)_([^_\n]+)_(?=\W|$)/g, "$1<i>$2</i>");
+  const out = []; let list = null, para = [];
+  const flushPara = () => { if (para.length) out.push(`<p>${para.map(inline).join("<br>")}</p>`); para = []; };
+  const flushList = () => { if (list) out.push(`<${list.t}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.t}>`); list = null; };
+  for (const line of src.split("\n")) {
+    let m;
+    if (/^\u0000\d+\u0000$/.test(line.trim())) { flushPara(); flushList(); out.push(blocks[+line.trim().slice(1, -1)]); }
+    else if ((m = line.match(/^(#{1,4})\s+(.*)/))) { flushPara(); flushList(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
+    else if ((m = line.match(/^\s*[-*]\s+(.*)/)) || (m = line.match(/^\s*\d+[.)]\s+(.*)/))) {
+      flushPara(); const t = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (!list || list.t !== t) { flushList(); list = { t, items: [] }; }
+      list.items.push(m[1]);
+    }
+    else if (!line.trim()) { flushPara(); flushList(); }
+    else { flushList(); para.push(line); }
+  }
+  flushPara(); flushList();
+  return out.join("");
+}
+
+// --- data loading ----------------------------------------------------------------------
+async function loadLayers() {
+  [state.contexts, state.agents] = await Promise.all([api("/api/contexts"), api("/api/agents")]);
+}
+async function loadChats() { state.chats = await api("/api/chats"); renderChatList(); }
+async function refreshStatus() {
+  const s = await api("/api/status");
+  const label = s.provider === "mock" ? "Mock (no API calls)" : `${s.provider} / ${s.model || "no model set"}`;
+  $("#provider").innerHTML = `Model: ${esc(label)}` +
+    (s.needs_setup ? ` · <button class="link" onclick="openSettings()">finish setup</button>` : "");
+  return s;
+}
+
+// --- sidebar -------------------------------------------------------------------------
+function renderChatList() {
+  const q = $("#chat-search").value.toLowerCase();
+  const ul = $("#chat-list"); ul.innerHTML = "";
+  for (const c of state.chats.filter((c) => c.title.toLowerCase().includes(q))) {
+    const li = document.createElement("li");
+    li.className = state.chat && state.chat.id === c.id ? "active" : "";
+    li.innerHTML = `<div class="t">${esc(c.title)}</div><div class="d">${when(c.updated)} · ${c.count} msgs</div>`;
+    li.onclick = () => openChat(c.id);
+    ul.appendChild(li);
+  }
+}
+
+// --- settings ------------------------------------------------------------------------
+function keyStatusText(s) {
+  if (!s.key_set) return "No key yet.";
+  if (s.key_source === "saved in Settings")
+    return `A key is saved (${s.key_hint}), ${s.key_storage}. Leave the box blank to keep it.`;
+  return `Using the key ${s.key_source} (${s.key_hint}). A key typed here takes priority.`;
+}
+function showSettings(s) {
+  $("#set-endpoint").textContent = s.endpoint ? `Requests go to: ${s.endpoint}` : "";
+  $("#set-key-status").textContent = keyStatusText(s);
+}
+async function openSettings() {
+  const s = await api("/api/settings");
+  $("#set-provider").value = s.provider;
+  $("#set-model").value = s.model || "";
+  $("#set-base-url").value = s.base_url || "";
+  $("#set-max").value = s.max_tokens;
+  $("#set-key").value = "";
+  showSettings(s);
+  $("#set-data-dir").textContent = `Data folder: ${s.data_dir}`;
+  $("#set-test-result").textContent = "";
+  syncProviderFields();
+  $("#dlg-settings").showModal();
+}
+function syncProviderFields() {
+  $("#genai-fields").hidden = $("#set-provider").value !== "genai";
+}
+$("#set-provider").onchange = syncProviderFields;
+async function saveSettings(extra = {}) {
+  const body = { provider: $("#set-provider").value, model: $("#set-model").value,
+    base_url: $("#set-base-url").value, max_tokens: $("#set-max").value, ...extra };
+  const key = $("#set-key").value.trim();
+  if (key) body.api_key = key;
+  showSettings(await api("/api/settings", { json: body }));
+  $("#set-key").value = "";
+  await refreshStatus();
+}
+$("#btn-set-save").onclick = async () => {
+  try { await saveSettings(); $("#dlg-settings").close(); toast("Settings saved"); }
+  catch (e) { $("#set-test-result").textContent = e.message; }
+};
+$("#btn-set-test").onclick = async () => {
+  const out = $("#set-test-result");
+  try {
+    await saveSettings(); out.textContent = "Testing…";
+    const r = await api("/api/settings/test", { json: {} });
+    out.textContent = `Connected (${r.seconds}s). Reply: ${r.reply}`;
+  } catch (e) { out.textContent = "Failed: " + e.message; }
+};
+$("#btn-set-clear").onclick = async () => {
+  if (!confirm("Forget the saved API key?")) return;
+  await saveSettings({ clear_key: true }); toast("Saved key removed");
+};
+
+// --- layer picker (new chat / change layers) ----------------------------------------
+let pickerMode = "new";
+function lastPick() { try { return JSON.parse(localStorage.getItem("lastPick")) || {}; } catch { return {}; } }
+async function openPicker(mode) {
+  pickerMode = mode;
+  await loadLayers();
+  const cur = mode === "edit" ? { context_id: state.chat.context_id, agent_ids: state.chat.agent_ids } : lastPick();
+  if (mode === "new" && !byId(state.contexts, cur.context_id) && state.contexts[0]) cur.context_id = state.contexts[0].id;
+  $("#dlg-layers-title").textContent = mode === "new" ? "New chat - which layers?" : "Change layers for this chat";
+  $("#btn-layers-ok").textContent = mode === "new" ? "Start chat" : "Apply";
+  const opt = (type, name, l, checked) => `<label><input type="${type}" name="${name}" value="${l.id}" ${checked ? "checked" : ""}>
+      <span>${esc(l.name)}${l.description ? `<div class="desc">${esc(l.description)}</div>` : ""}</span></label>`;
+  $("#pick-context").innerHTML =
+    opt("radio", "ctx", { id: "", name: "(none)" }, !cur.context_id) +
+    state.contexts.map((c) => opt("radio", "ctx", c, c.id === cur.context_id)).join("");
+  $("#pick-agents").innerHTML = state.agents.length
+    ? state.agents.map((a) => opt("checkbox", "agent", a, (cur.agent_ids || []).includes(a.id))).join("")
+    : `<p class="muted small">No agents yet - create some under Contexts &amp; agents.</p>`;
+  $("#dlg-layers").showModal();
+}
+$("#btn-layers-ok").onclick = async () => {
+  $("#dlg-layers").close();
+  const pick = {
+    context_id: document.querySelector('input[name="ctx"]:checked')?.value || null,
+    agent_ids: [...document.querySelectorAll('input[name="agent"]:checked')].map((i) => i.value),
+  };
+  try {
+    if (pickerMode === "new") {
+      try { localStorage.setItem("lastPick", JSON.stringify(pick)); } catch {}
+      const chat = await api("/api/chats", { json: pick });
+      await loadChats(); openChat(chat.id);
+    } else {
+      state.chat = await api(`/api/chats/${state.chat.id}`, { method: "PATCH", json: pick });
+      renderChat(); loadChats();
+    }
+  } catch (e) { toast(e.message); }
+};
+
+// --- chat view -----------------------------------------------------------------------
+async function openChat(id) {
+  await loadLayers();
+  state.chat = await api(`/api/chats/${id}`);
+  $("#empty-state").hidden = true; $("#chat-view").hidden = false;
+  renderChat(); renderChatList(); $("#input").focus();
+}
+function renderChat() {
+  const c = state.chat;
+  $("#chat-title").value = c.title;
+  const ctx = byId(state.contexts, c.context_id);
+  const chips = [ctx ? `<span class="chip ctx" title="Job context">${esc(ctx.name)}</span>`
+                     : `<span class="chip none">no job context</span>`];
+  for (const id of c.agent_ids) {
+    const a = byId(state.agents, id);
+    chips.push(a ? `<span class="chip" title="Agent">${esc(a.name)}</span>` : `<span class="chip none">deleted agent</span>`);
+  }
+  if (!c.agent_ids.length) chips.push(`<span class="chip muted">no agents</span>`);
+  $("#chat-layers").innerHTML = chips.join("");
+  const box = $("#messages"); box.innerHTML = "";
+  c.messages.forEach((m) => box.appendChild(msgEl(m.role, m.content)));
+  box.scrollTop = box.scrollHeight;
+}
+function msgEl(role, content, cls = "") {
+  const d = document.createElement("div");
+  d.className = `msg ${role} ${cls}`;
+  const body = role === "assistant" && !cls ? md(content) : esc(content);
+  d.innerHTML = `<div class="who">${role === "user" ? "You" : "Assistant"}</div><div class="body">${body}</div>`;
+  if (role === "assistant" && !cls) {
+    const a = document.createElement("div"); a.className = "actions";
+    const b = document.createElement("button"); b.textContent = "Copy";
+    b.onclick = () => navigator.clipboard.writeText(content).then(() => toast("Copied"));
+    a.appendChild(b); d.appendChild(a);
+  }
+  return d;
+}
+async function send(text) {
+  const box = $("#messages");
+  box.appendChild(msgEl("user", text));
+  const pending = msgEl("assistant", "Thinking…", "pending");
+  box.appendChild(pending); box.scrollTop = box.scrollHeight;
+  $("#btn-send").disabled = true;
+  try {
+    state.chat = await api(`/api/chats/${state.chat.id}/messages`, { json: { content: text } });
+    renderChat(); loadChats();
+  } catch (e) {
+    pending.remove(); box.lastChild.remove();          // drop the optimistic user bubble
+    box.appendChild(msgEl("assistant", e.message, "error"));
+    $("#input").value = text;                           // give the text back to retry
+  } finally { $("#btn-send").disabled = false; }
+}
+$("#composer").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("#input").value.trim();
+  if (!text || !state.chat) return;
+  $("#input").value = "";
+  if (text.startsWith("/update")) openUpdate(text.slice(7).trim()); else send(text);
+});
+$("#input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#composer").requestSubmit(); }
+});
+$("#chat-title").addEventListener("change", async () => {
+  state.chat = await api(`/api/chats/${state.chat.id}`, { method: "PATCH", json: { title: $("#chat-title").value.trim() || "Untitled" } });
+  loadChats();
+});
+$("#btn-delete-chat").onclick = async () => {
+  if (!confirm(`Delete "${state.chat.title}"? This can't be undone.`)) return;
+  await api(`/api/chats/${state.chat.id}`, { method: "DELETE" });
+  state.chat = null; $("#chat-view").hidden = true; $("#empty-state").hidden = false; loadChats();
+};
+$("#btn-view-prompt").onclick = async () => {
+  $("#prompt-text").textContent = (await api(`/api/chats/${state.chat.id}/system_prompt`)).system;
+  $("#dlg-prompt").showModal();
+};
+
+// --- update a layer from the chat ----------------------------------------------------
+async function openUpdate(instruction = "") {
+  await loadLayers();
+  const c = state.chat, sel = $("#upd-target"); sel.innerHTML = "";
+  const add = (kind, l, label) => sel.add(new Option(label, `${kind}:${l.id}`));
+  c.agent_ids.map((id) => byId(state.agents, id)).filter(Boolean).forEach((a) => add("agents", a, `Agent: ${a.name} (in this chat)`));
+  const ctx = byId(state.contexts, c.context_id);
+  if (ctx) add("contexts", ctx, `Job context: ${ctx.name}`);
+  state.agents.filter((a) => !c.agent_ids.includes(a.id)).forEach((a) => add("agents", a, `Agent: ${a.name}`));
+  // "/update Writer remember X" targets the agent whose name the instruction starts with.
+  const hit = state.agents.find((a) => instruction.toLowerCase().startsWith(a.name.toLowerCase() + " "));
+  if (hit) { sel.value = `agents:${hit.id}`; instruction = instruction.slice(hit.name.length).trim(); }
+  $("#upd-instruction").value = instruction;
+  $("#upd-compare").hidden = true; $("#btn-upd-save").disabled = true; $("#upd-status").textContent = "";
+  $("#dlg-update").showModal();
+}
+$("#btn-update-layer").onclick = () => openUpdate();
+$("#btn-upd-cancel").onclick = () => $("#dlg-update").close();
+$("#btn-upd-propose").onclick = async () => {
+  const [kind, id] = $("#upd-target").value.split(":");
+  if (!id) return toast("No layer selected");
+  $("#upd-status").textContent = "Asking the model…"; $("#btn-upd-propose").disabled = true;
+  try {
+    const r = await api(`/api/chats/${state.chat.id}/propose_update`, { json: { kind, id, instruction: $("#upd-instruction").value } });
+    $("#upd-current").textContent = r.current; $("#upd-proposed").value = r.proposed;
+    $("#upd-compare").hidden = false; $("#btn-upd-save").disabled = false;
+    $("#upd-status").textContent = "Review and edit the proposal, then save.";
+  } catch (e) { $("#upd-status").textContent = e.message; }
+  finally { $("#btn-upd-propose").disabled = false; }
+};
+$("#btn-upd-save").onclick = async () => {
+  const [kind, id] = $("#upd-target").value.split(":");
+  await api(`/api/${kind}/${id}`, { method: "PUT", json: { content: $("#upd-proposed").value, note: `From chat: ${state.chat.title}` } });
+  $("#dlg-update").close(); toast("Layer updated - applies from the next message on"); loadLayers();
+};
+
+// --- library (contexts + agents editor) ------------------------------------------------
+async function openLibrary(kind = state.libKind, selId = null) {
+  state.libKind = kind; state.libSel = selId;
+  await loadLayers();
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.kind === kind));
+  renderLibList();
+  if (selId) renderLibEdit(); else $("#lib-edit").innerHTML = `<p class="muted">Select an item, or create a new one.</p>`;
+  if (!$("#dlg-library").open) $("#dlg-library").showModal();
+}
+function renderLibList() {
+  const ul = $("#lib-items"); ul.innerHTML = "";
+  for (const l of state[state.libKind]) {
+    const li = document.createElement("li");
+    li.className = l.id === state.libSel ? "active" : "";
+    li.innerHTML = `${esc(l.name)}<div class="small muted">${when(l.updated)}${l.versions ? ` · v${l.versions + 1}` : ""}</div>`;
+    li.onclick = () => { state.libSel = l.id; renderLibList(); renderLibEdit(); };
+    ul.appendChild(li);
+  }
+}
+function renderLibEdit() {
+  const kind = state.libKind, l = byId(state[kind], state.libSel);
+  if (!l) return;
+  const hint = kind === "contexts"
+    ? "Who you are: role, organisation, responsibilities, audiences, terminology, how you like answers."
+    : "How this agent should help: its focus, standards, formats, and things to watch for.";
+  $("#lib-edit").innerHTML = `
+    <label>Name <input id="le-name" value="${esc(l.name)}" style="width:100%"></label>
+    <label>Description <input id="le-desc" value="${esc(l.description || "")}" style="width:100%"></label>
+    <div class="muted small">${hint}</div>
+    <textarea id="le-content" class="content">${esc(l.content)}</textarea>
+    <div class="row">
+      <button id="le-save" class="primary">Save</button>
+      <button id="le-export">Export .md</button>
+      <button id="le-hist">Version history (${l.versions})</button>
+      <button id="le-del" class="danger">Delete</button>
+    </div>
+    <div id="le-history"></div>`;
+  $("#le-save").onclick = async () => {
+    await api(`/api/${kind}/${l.id}`, { method: "PUT", json: { name: $("#le-name").value, description: $("#le-desc").value, content: $("#le-content").value, note: "Manual edit" } });
+    toast("Saved"); openLibrary(kind, l.id);
+  };
+  $("#le-export").onclick = () => (location.href = `/api/${kind}/${l.id}/export`);
+  $("#le-del").onclick = async () => {
+    if (!confirm(`Delete "${l.name}"? Chats using it will simply stop including it.`)) return;
+    await api(`/api/${kind}/${l.id}`, { method: "DELETE" }); openLibrary(kind);
+  };
+  $("#le-hist").onclick = async () => {
+    const h = await api(`/api/${kind}/${l.id}/history`);
+    $("#le-history").innerHTML = h.length
+      ? `<div class="history"><b>Previous versions</b> (newest first) - Load puts it in the editor; Save to restore.<ul>${h.map((v, i) =>
+          `<li>${when(v.saved)} ${v.note ? `<span class="muted">- ${esc(v.note)}</span>` : ""} <button data-i="${i}">Load</button></li>`).join("")}</ul></div>`
+      : `<p class="muted small">No earlier versions.</p>`;
+    $("#le-history").querySelectorAll("button").forEach((b) => (b.onclick = () => {
+      $("#le-content").value = h[+b.dataset.i].content; toast("Loaded into editor - Save to restore it");
+    }));
+  };
+}
+document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => openLibrary(t.dataset.kind)));
+$("#btn-lib-new").onclick = async () => {
+  const name = prompt(state.libKind === "contexts" ? "Name for the job context:" : "Name for the agent:");
+  if (!name) return;
+  const l = await api(`/api/${state.libKind}`, { json: { name, content: "" } });
+  openLibrary(state.libKind, l.id);
+};
+$("#btn-library").onclick = () => openLibrary();
+$("#btn-library-close").onclick = () => { $("#dlg-library").close(); if (state.chat) openChat(state.chat.id); };
+
+// --- import / export (files are read in the browser and sent as text) ----------------
+$("#btn-import").onclick = () => { $("#imp-files").value = ""; $("#dlg-import").showModal(); };
+$("#btn-imp-ok").onclick = async () => {
+  $("#dlg-import").close();
+  const picked = [...$("#imp-files").files];
+  if (!picked.length) return;
+  try {
+    const files = await Promise.all(picked.map(async (f) => ({ name: f.name, text: await f.text() })));
+    const r = await api("/api/import", { json: { kind: $("#imp-kind").value, files } });
+    toast(`Imported ${r.created.length}: ${r.created.join(", ")}`); loadLayers(); loadChats();
+  } catch (e) { toast(e.message); }
+};
+$("#btn-export").onclick = () => $("#dlg-export").showModal();
+$("#btn-exp-ok").onclick = () => {
+  $("#dlg-export").close();
+  location.href = `/api/export${$("#exp-chats").checked ? "?chats=1" : ""}`;
+};
+
+// --- boot ----------------------------------------------------------------------------
+$("#btn-new-chat").onclick = () => openPicker("new");
+$("#btn-edit-layers").onclick = () => openPicker("edit");
+$("#btn-settings").onclick = () => openSettings();
+$("#chat-search").oninput = renderChatList;
+(async () => {
+  const s = await refreshStatus();
+  await loadLayers(); await loadChats();
+  if (s.needs_setup) openSettings();
+})();
+"""
+
+# ===== 10. INSTALL & STARTUP ========================================================
+
+def seed_examples():
+    if any(any(_dir(k).glob("*.json")) for k in KINDS):
+        return
+    new_layer("contexts", "My job (example - edit me)", """\
+## Role
+- Title: <your title>, <grade/level>
+- Organisation: <agency / office / division>
+- I report to: <role>. People who rely on my work: <who>
+
+## What I do
+- <core responsibility 1>
+- <core responsibility 2>
+
+## How I like answers
+- Plain language, short paragraphs, lead with the answer.
+- Cite the regulation/policy when one applies; say so when you're unsure.
+- Use our terminology: <acronyms and what they mean>
+""", "Edit this to describe your actual job.")
+    new_layer("agents", "Writer", """\
+You help draft and edit written products: emails, memos, briefings, and reports.
+- Match the formality of the audience; default to a professional, plain-language tone.
+- When drafting, give one strong draft rather than several options unless asked.
+- Flag anything that reads as a commitment or a policy statement so I can check it.
+""", "Drafts and edits correspondence and documents.")
+    new_layer("agents", "Analyst", """\
+You help me think through problems, data, and policy questions.
+- Separate what is known, what is assumed, and what is a judgement call.
+- When there are trade-offs, recommend one option and say why.
+- Point out what I'd need to verify before acting on the analysis.
+""", "Structured reasoning, trade-offs, and recommendations.")
+
+
+def install():
+    """Creates the data folders and a 'Start Job-Context.bat' next to this file."""
+    print(f"Installing Job-Context Client {APP_VERSION} in {APP_DIR}\n")
+    for k in KINDS + ("chats",):
+        _dir(k)
+    seed_examples()
+    print(f"  Data folder ready: {DATA}")
+    if os.name == "nt":
+        bat = APP_DIR / "Start Job-Context.bat"
+        bat.write_text('@echo off\ncd /d "%~dp0"\n'          # text mode writes \r\n
+                       f'"{sys.executable}" jobcontext.txt %*\n'
+                       "if errorlevel 1 pause\n", encoding="utf-8")
+        print(f"\n  Created: {bat.name}  (double-click it to start the app)")
+    print("\nInstall complete. Your API key is entered in the app under Settings.")
+
+
+class Server(ThreadingHTTPServer):
+    # The stdlib default (True) lets two programs share a port on Windows, so a port
+    # already in use wouldn't be detected and the browser could reach the other app.
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+
+def serve(port: int, open_browser: bool):
+    seed_examples()
+    server = None
+    for p in range(port, port + 10):                 # step past ports already in use
+        try:
+            server = Server(("127.0.0.1", p), Handler)
+            break
+        except OSError:
+            continue
+    if not server:
+        sys.exit(f"No free port between {port} and {port + 9}.")
+    url = f"http://127.0.0.1:{server.server_port}"
+    print(f"Job-Context Client {APP_VERSION} running at {url}")
+    print(f"Data folder: {DATA}")
+    print("Close this window (or press Ctrl+C) to stop the app.")
+    if open_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "--install" in args:
+        install()
+    else:
+        port = int(args[args.index("--port") + 1]) if "--port" in args else 5000
+        serve(port, open_browser="--no-browser" not in args)
